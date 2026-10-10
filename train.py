@@ -51,7 +51,8 @@ def parse_args() -> argparse.Namespace:
         default="/mnt/data/Coding3/celeba-dit-lab/cached_data/celeba_train_latents_clustered.pt",
     )
     parser.add_argument("--output-dir", type=str, default="runs/pyramid-looped-dit")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--max-steps", type=int, default=0, help="0 means train for all requested epochs")
     parser.add_argument(
         "--screening-steps",
@@ -181,6 +182,21 @@ def train(args: argparse.Namespace) -> Path:
     model = PyramidLoopedDiT(**model_config(args)).to(device)
     ema = ModelEMA(model, decay=args.ema_decay)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    start_step = 0
+    start_epoch = 0
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.exists():
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+            if "ema" in ckpt:
+                ema.module.load_state_dict(ckpt["ema"])
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = int(ckpt.get("step", 0))
+            start_epoch = int(ckpt.get("epoch", 0))
+            print(f"Resumed from {resume_path} at step {start_step}, epoch {start_epoch}")
     dataset = CelebAHQPixelDataset(
         image_dir=args.image_dir,
         label_cache_path=args.label_cache_path,
@@ -197,11 +213,11 @@ def train(args: argparse.Namespace) -> Path:
     )
 
     limit = args.screening_steps or args.max_steps
-    global_step = 0
+    global_step = start_step
     last_checkpoint = tracker.checkpoints_dir / "latest.pt"
     try:
         model.train()
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             for images, labels in loader:
                 if limit and global_step >= limit:
                     break

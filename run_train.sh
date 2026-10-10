@@ -17,7 +17,9 @@ mkdir -p outputs/pyramid_looped_dit_50m
 PYTHONPATH=. /home/kuroko/.conda/envs/ai/bin/python train.py \
   --output-dir outputs/pyramid_looped_dit_50m \
   --batch-size 16 \
+  --epochs 60 \
   --max-steps 105000 \
+  --resume outputs/pyramid_looped_dit_50m/checkpoints/latest.pt \
   --num-workers 2 \
   --learning-rate 2e-4 \
   --gradient-clip 0.5 \
