@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch import nn
 
 from models import PyramidLoopedDiT, euler_sample, training_loss
 
@@ -30,6 +31,23 @@ def test_forward_preserves_pixel_shape(model: PyramidLoopedDiT) -> None:
     assert torch.isfinite(prediction).all()
     assert prediction.min() >= -1.0
     assert prediction.max() <= 1.0
+
+
+def test_training_loss_matches_jit_x_prediction_formula() -> None:
+    class ZeroPredictor(nn.Module):
+        def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
+            return torch.zeros_like(x)
+
+    clean = torch.tensor([[[[1.0]]], [[[2.0]]]])
+    noise = torch.tensor([[[[0.0]]], [[[1.0]]]])
+    timesteps = torch.tensor([0.0, 0.95])
+    x_t = timesteps.reshape(2, 1, 1, 1) * clean + (1.0 - timesteps.reshape(2, 1, 1, 1)) * noise
+    denominator = (1.0 - timesteps).clamp_min(0.05).reshape(2, 1, 1, 1)
+    expected = torch.mean(((torch.zeros_like(clean) - x_t) / denominator - (clean - noise)) ** 2)
+
+    actual = training_loss(ZeroPredictor(), clean, t=timesteps, eps=noise)
+
+    assert torch.equal(actual, expected)
 
 
 def test_training_loss_backward_is_finite(model: PyramidLoopedDiT) -> None:

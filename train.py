@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import random
 from copy import deepcopy
 from pathlib import Path
@@ -150,18 +151,21 @@ def save_sample_grid(samples: torch.Tensor, path: Path) -> None:
 
 def autocast_context(device: torch.device, enabled: bool):
     can_bfloat16 = device.type in {"cuda", "cpu"}
+    if not enabled or not can_bfloat16:
+        return nullcontext()
     return torch.autocast(
         device_type=device.type,
         dtype=torch.bfloat16,
-        enabled=enabled and can_bfloat16,
     )
 
 
 def train(args: argparse.Namespace) -> Path:
-    if args.epochs < 1 or args.batch_size < 1:
-        raise ValueError("epochs and batch-size must be positive")
+    if args.epochs < 1 or args.batch_size < 1 or args.num_classes < 1:
+        raise ValueError("epochs, batch-size, and num-classes must be positive")
     if args.screening_steps < 0 or args.max_steps < 0:
         raise ValueError("step limits cannot be negative")
+    if args.sample_count < 1 or args.sample_steps < 1:
+        raise ValueError("sample-count and sample-steps must be positive")
     set_seed(args.seed)
     device = resolve_device(args.device)
     config = {**vars(args), "device_resolved": str(device)}
@@ -263,4 +267,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
