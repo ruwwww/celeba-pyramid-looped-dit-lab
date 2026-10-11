@@ -121,40 +121,22 @@ class AdaLNBlock(nn.Module):
         return x + torch.tanh(gate_mlp[:, None, :]) * feed_forward
 
 
-class _UpsampleBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+class LinearOutputHead(nn.Module):
+    """Conditioned token-wise projection used by JiT/Linum-AI readouts."""
+
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int) -> None:
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=min(8, out_channels), num_channels=out_channels),
-            nn.SiLU(),
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.ada_norm = nn.Linear(hidden_size, hidden_size * 2)
+        self.proj = nn.Linear(
+            hidden_size,
+            patch_size * patch_size * out_channels,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.block(x)
-
-
-class PyramidDecoder(nn.Module):
-    """Progressive 16x16-to-256x256 decoder for direct RGB prediction."""
-
-    def __init__(self, token_channels: int, decoder_channels: int = 128, out_channels: int = 3) -> None:
-        super().__init__()
-        self.input = nn.Sequential(
-            nn.Conv2d(token_channels, decoder_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(num_groups=8, num_channels=decoder_channels),
-            nn.SiLU(),
-        )
-        self.upsample = nn.Sequential(
-            _UpsampleBlock(decoder_channels, decoder_channels),
-            _UpsampleBlock(decoder_channels, decoder_channels // 2),
-            _UpsampleBlock(decoder_channels // 2, decoder_channels // 4),
-            _UpsampleBlock(decoder_channels // 4, decoder_channels // 8),
-        )
-        self.output = nn.Conv2d(decoder_channels // 8, out_channels, kernel_size=3, padding=1)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.output(self.upsample(self.input(x)))
+    def forward(self, tokens: Tensor, condition: Tensor) -> Tensor:
+        shift, scale = self.ada_norm(condition).chunk(2, dim=-1)
+        normalized = _ada_modulate(self.norm(tokens), shift, scale)
+        return self.proj(normalized)
 
 
 class PyramidLoopedDiT(nn.Module):
@@ -199,6 +181,9 @@ class PyramidLoopedDiT(nn.Module):
         self.patch_size = patch_size
         self.grid_size = image_size // patch_size
         self.num_tokens = self.grid_size * self.grid_size
+        self.pyramid_patch_size = patch_size // 2
+        if self.pyramid_patch_size < 1:
+            raise ValueError("patch_size must be at least 2 for the pyramid readout")
         self.loop_split = tuple(int(depth) for depth in loop_split)
         self.loop_repeats = loop_repeats
 
@@ -229,10 +214,13 @@ class PyramidLoopedDiT(nn.Module):
             [AdaLNBlock(hidden_size, num_heads, mlp_ratio) for _ in range(post_depth)]
         )
         self.loop_boundary_norm = RMSNorm(hidden_size)
-
-        decoder_channels = 128
-        self.output_projection = nn.Linear(hidden_size, decoder_channels)
-        self.decoder = PyramidDecoder(decoder_channels, decoder_channels, in_channels)
+        self.final_head = LinearOutputHead(hidden_size, patch_size, in_channels)
+        self.pyramid_head = LinearOutputHead(
+            hidden_size,
+            self.pyramid_patch_size,
+            in_channels,
+        )
+        self.repa_proj = nn.Linear(hidden_size, 384)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -243,9 +231,6 @@ class PyramidLoopedDiT(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.GroupNorm):
-                nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
         for block in (*self.pre_blocks, *self.core_blocks, *self.post_blocks):
             nn.init.zeros_(block.ada_bias)
 
@@ -269,7 +254,33 @@ class PyramidLoopedDiT(nn.Module):
             raise ValueError(f"class labels must be in [0, {self.null_class}]")
         return labels
 
-    def forward(self, x: Tensor, t: Tensor, y: Tensor | None = None) -> Tensor:
+    def _unpatchify(self, patches: Tensor, patch_size: int) -> Tensor:
+        batch_size, token_count, patch_values = patches.shape
+        expected_values = patch_size * patch_size * self.in_channels
+        if token_count != self.num_tokens or patch_values != expected_values:
+            raise ValueError("readout shape does not match the configured token grid")
+        image = patches.reshape(
+            batch_size,
+            self.grid_size,
+            self.grid_size,
+            patch_size,
+            patch_size,
+            self.in_channels,
+        )
+        return image.permute(0, 5, 1, 3, 2, 4).reshape(
+            batch_size,
+            self.in_channels,
+            self.grid_size * patch_size,
+            self.grid_size * patch_size,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        t: Tensor,
+        y: Tensor | None = None,
+        return_pyramid: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         if x.ndim != 4 or x.shape[1] != self.in_channels:
             raise ValueError(f"expected [B, {self.in_channels}, H, W] input")
         if x.shape[-2:] != (self.image_size, self.image_size):
@@ -292,19 +303,20 @@ class PyramidLoopedDiT(nn.Module):
             for block in self.core_blocks:
                 tokens = block(tokens, modulation)
             tokens = self.loop_boundary_norm(tokens)
+        pyramid_tokens = tokens
         for block in self.post_blocks:
             tokens = block(tokens, modulation)
 
-        features = self.output_projection(tokens)
-        features = features.transpose(1, 2).reshape(
-            batch_size,
-            -1,
-            self.grid_size,
-            self.grid_size,
-        )
-        return torch.tanh(self.decoder(features))
+        final_patches = self.final_head(tokens, condition)
+        x_hat = torch.tanh(self._unpatchify(final_patches, self.patch_size))
+        if not return_pyramid:
+            return x_hat
+
+        pyramid_patches = self.pyramid_head(pyramid_tokens, condition)
+        x_hat_pyramid = torch.tanh(self._unpatchify(pyramid_patches, self.pyramid_patch_size))
+        repa_tokens = self.repa_proj(pyramid_tokens)
+        return x_hat, x_hat_pyramid, repa_tokens
 
     @property
     def num_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
-

@@ -33,6 +33,24 @@ def test_forward_preserves_pixel_shape(model: PyramidLoopedDiT) -> None:
     assert prediction.max() <= 1.0
 
 
+def test_forward_returns_pyramid_readout_and_repa_tokens(model: PyramidLoopedDiT) -> None:
+    model.eval()
+    x = torch.randn(2, 3, 256, 256, device=DEVICE)
+    t = torch.full((2,), 0.5, device=DEVICE)
+    y = torch.tensor([0, 1], device=DEVICE)
+
+    with torch.no_grad():
+        prediction, pyramid, repa_tokens = model(x, t, y, return_pyramid=True)
+
+    assert prediction.shape == (2, 3, 256, 256)
+    assert pyramid.shape == (2, 3, 128, 128)
+    assert repa_tokens.shape == (2, 256, 384)
+    assert torch.isfinite(pyramid).all()
+    assert torch.isfinite(repa_tokens).all()
+    assert pyramid.min() >= -1.0
+    assert pyramid.max() <= 1.0
+
+
 def test_training_loss_matches_jit_x_prediction_formula() -> None:
     class ZeroPredictor(nn.Module):
         def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None = None) -> torch.Tensor:
