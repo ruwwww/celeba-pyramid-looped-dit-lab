@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from models import PerceptualLosses, PyramidLoopedDiT, euler_sample, training_loss
+from models import PerceptualLosses, PyramidLoopedDiT, euler_sample, noise_gate, training_loss
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -49,6 +49,11 @@ def test_forward_returns_pyramid_readout_and_repa_tokens(model: PyramidLoopedDiT
     assert torch.isfinite(repa_tokens).all()
     assert pyramid.min() >= -1.0
     assert pyramid.max() <= 1.0
+
+
+def test_noise_gate_activates_at_threshold() -> None:
+    timesteps = torch.tensor([0.0, 0.299, 0.3, 1.0])
+    assert torch.equal(noise_gate(timesteps), torch.tensor([0.0, 0.0, 1.0, 1.0]))
 
 
 def test_training_loss_matches_jit_x_prediction_formula() -> None:

@@ -163,6 +163,8 @@ class PyramidLoopedDiT(nn.Module):
         class_dropout_prob: float = 0.15,
     ) -> None:
         super().__init__()
+        if patch_size < 2 or patch_size % 2 != 0:
+            raise ValueError("patch_size must be an even integer of at least 2")
         if image_size % patch_size != 0:
             raise ValueError("image_size must be divisible by patch_size")
         if len(loop_split) != 3 or any(depth < 0 for depth in loop_split):
@@ -182,8 +184,6 @@ class PyramidLoopedDiT(nn.Module):
         self.grid_size = image_size // patch_size
         self.num_tokens = self.grid_size * self.grid_size
         self.pyramid_patch_size = patch_size // 2
-        if self.pyramid_patch_size < 1:
-            raise ValueError("patch_size must be at least 2 for the pyramid readout")
         self.loop_split = tuple(int(depth) for depth in loop_split)
         self.loop_repeats = loop_repeats
 

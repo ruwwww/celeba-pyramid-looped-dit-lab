@@ -225,8 +225,7 @@ class PerceptualLosses(nn.Module):
         repa_tokens: Tensor | None,
         t: Tensor,
     ) -> dict[str, Tensor]:
-        batch_size = prediction.shape[0]
-        zeros = prediction.new_zeros(batch_size)
+        zeros = prediction.new_zeros(prediction.shape[0])
         gate = noise_gate(t).to(device=prediction.device, dtype=prediction.dtype)
         if not self.enabled:
             return {"lpips": zeros, "p_dino": zeros, "repa": zeros, "gate": gate}

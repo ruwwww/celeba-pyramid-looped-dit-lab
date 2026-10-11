@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
 
 from data.dataset import CelebAHQPixelDataset
-from models import PyramidLoopedDiT, euler_sample, training_loss
+from models import PerceptualLosses, PyramidLoopedDiT, euler_sample, training_loss
 from tracker import ExperimentTracker
 
 
@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=4)
     parser.add_argument("--cfg-scale", type=float, default=3.0)
     parser.add_argument("--num-classes", type=int, default=64)
+    parser.add_argument(
+        "--use-pretrained-perceptual",
+        action="store_true",
+        help="Load LPIPS VGG and DINOv2 weights lazily; offline fallback remains available by default",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="celeba-flow-dit")
@@ -180,6 +185,10 @@ def train(args: argparse.Namespace) -> Path:
     )
 
     model = PyramidLoopedDiT(**model_config(args)).to(device)
+    perceptual_losses = PerceptualLosses(
+        enabled=True,
+        use_pretrained=args.use_pretrained_perceptual,
+    )
     ema = ModelEMA(model, decay=args.ema_decay)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -225,7 +234,13 @@ def train(args: argparse.Namespace) -> Path:
                 labels = labels.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with autocast_context(device, args.amp):
-                    loss = training_loss(model, images, y=labels)
+                    loss, loss_components = training_loss(
+                        model,
+                        images,
+                        y=labels,
+                        perceptual_losses=perceptual_losses,
+                        return_components=True,
+                    )
                 loss.backward()
                 if args.gradient_clip > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
@@ -234,10 +249,20 @@ def train(args: argparse.Namespace) -> Path:
                 global_step += 1
 
                 if global_step % max(1, args.log_every) == 0 or global_step == 1:
+                    metrics = {
+                        "loss": loss.detach().float().item(),
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                    metrics.update(
+                        {
+                            f"loss_{name}": value.float().item()
+                            for name, value in loss_components.items()
+                        }
+                    )
                     tracker.log_metrics(
                         step=global_step,
                         epoch=epoch,
-                        metrics={"loss": loss.detach().float().item(), "lr": optimizer.param_groups[0]["lr"]},
+                        metrics=metrics,
                     )
 
                 if args.sample_every > 0 and global_step % args.sample_every == 0:
