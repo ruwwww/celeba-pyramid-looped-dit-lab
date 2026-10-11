@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from models import PyramidLoopedDiT, euler_sample, training_loss
+from models import PerceptualLosses, PyramidLoopedDiT, euler_sample, training_loss
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,7 +63,13 @@ def test_training_loss_matches_jit_x_prediction_formula() -> None:
     denominator = (1.0 - timesteps).clamp_min(0.05).reshape(2, 1, 1, 1)
     expected = torch.mean(((torch.zeros_like(clean) - x_t) / denominator - (clean - noise)) ** 2)
 
-    actual = training_loss(ZeroPredictor(), clean, t=timesteps, eps=noise)
+    actual = training_loss(
+        ZeroPredictor(),
+        clean,
+        t=timesteps,
+        eps=noise,
+        perceptual_losses=PerceptualLosses(enabled=False),
+    )
 
     assert torch.equal(actual, expected)
 
@@ -73,9 +79,18 @@ def test_training_loss_backward_is_finite(model: PyramidLoopedDiT) -> None:
     x1 = torch.randn(1, 3, 256, 256, device=DEVICE)
     y = torch.tensor([2], device=DEVICE)
 
-    loss = training_loss(model, x1, y=y)
+    loss, components = training_loss(
+        model,
+        x1,
+        y=y,
+        t=torch.tensor([0.8], device=DEVICE),
+        perceptual_losses=PerceptualLosses(enabled=True, use_pretrained=False),
+        return_components=True,
+    )
     assert loss.ndim == 0
     assert torch.isfinite(loss)
+    assert {"flow_final", "flow_pyramid", "lpips", "p_dino", "repa"} <= set(components)
+    assert all(torch.isfinite(value) for value in components.values())
 
     model.zero_grad(set_to_none=True)
     loss.backward()
