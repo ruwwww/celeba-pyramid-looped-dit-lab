@@ -31,13 +31,18 @@ class ModelEMA:
         self.module.requires_grad_(False)
 
     @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
+    def update(self, model: nn.Module, step: int = 0) -> None:
+        if step < 0:
+            raise ValueError("EMA step must be non-negative")
+        current_decay = min(self.decay, (1.0 + step) / (10.0 + step))
         ema_state = self.module.state_dict()
         model_state = model.state_dict()
         for name, ema_value in ema_state.items():
             value = model_state[name].detach()
             if ema_value.is_floating_point():
-                ema_value.mul_(self.decay).add_(value.to(dtype=ema_value.dtype), alpha=1.0 - self.decay)
+                ema_value.mul_(current_decay).add_(
+                    value.to(dtype=ema_value.dtype), alpha=1.0 - current_decay
+                )
             else:
                 ema_value.copy_(value)
 
@@ -113,7 +118,7 @@ def model_config(args: argparse.Namespace) -> dict[str, Any]:
         "in_channels": 3,
         "hidden_size": 512,
         "num_heads": 8,
-        "mlp_ratio": 6.0,
+        "mlp_ratio": 4.0,
         "bottleneck_channels": 128,
         "patch_size": 16,
         "loop_split": (2, 4, 2),
@@ -245,7 +250,7 @@ def train(args: argparse.Namespace) -> Path:
                 if args.gradient_clip > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
                 optimizer.step()
-                ema.update(model)
+                ema.update(model, step=global_step)
                 global_step += 1
 
                 if global_step % max(1, args.log_every) == 0 or global_step == 1:
@@ -282,6 +287,15 @@ def train(args: argparse.Namespace) -> Path:
                 if args.save_every > 0 and global_step % args.save_every == 0:
                     save_checkpoint(
                         tracker.checkpoints_dir / f"step_{global_step:07d}.pt",
+                        model,
+                        ema,
+                        optimizer,
+                        global_step,
+                        epoch,
+                        args,
+                    )
+                    save_checkpoint(
+                        last_checkpoint,
                         model,
                         ema,
                         optimizer,

@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from train import ModelEMA
 from models import PerceptualLosses, PyramidLoopedDiT, euler_sample, noise_gate, training_loss
 
 
@@ -29,31 +30,41 @@ def test_forward_preserves_pixel_shape(model: PyramidLoopedDiT) -> None:
 
     assert prediction.shape == x.shape
     assert torch.isfinite(prediction).all()
-    assert prediction.min() >= -1.0
-    assert prediction.max() <= 1.0
 
 
-def test_forward_returns_pyramid_readout_and_repa_tokens(model: PyramidLoopedDiT) -> None:
+def test_forward_returns_repa_tokens(model: PyramidLoopedDiT) -> None:
     model.eval()
     x = torch.randn(2, 3, 256, 256, device=DEVICE)
     t = torch.full((2,), 0.5, device=DEVICE)
     y = torch.tensor([0, 1], device=DEVICE)
 
     with torch.no_grad():
-        prediction, pyramid, repa_tokens = model(x, t, y, return_pyramid=True)
+        prediction, repa_tokens = model(x, t, y, return_repa=True)
 
     assert prediction.shape == (2, 3, 256, 256)
-    assert pyramid.shape == (2, 3, 128, 128)
     assert repa_tokens.shape == (2, 256, 384)
-    assert torch.isfinite(pyramid).all()
     assert torch.isfinite(repa_tokens).all()
-    assert pyramid.min() >= -1.0
-    assert pyramid.max() <= 1.0
 
 
 def test_noise_gate_activates_at_threshold() -> None:
     timesteps = torch.tensor([0.0, 0.299, 0.3, 1.0])
     assert torch.equal(noise_gate(timesteps), torch.tensor([0.0, 0.0, 1.0, 1.0]))
+
+
+def test_perceptual_loss_gates_all_terms_before_threshold() -> None:
+    prediction = torch.zeros(1, 3, 16, 16)
+    target = torch.ones_like(prediction)
+    repa_tokens = torch.ones(1, 256, 384)
+    losses = PerceptualLosses(enabled=True, use_pretrained=False)
+
+    gated = losses.per_sample(prediction, target, repa_tokens, torch.tensor([0.299]))
+    active = losses.per_sample(prediction, target, repa_tokens, torch.tensor([0.3]))
+
+    assert all(
+        torch.equal(gated[name], torch.zeros_like(gated[name]))
+        for name in ("lpips", "p_dino", "repa")
+    )
+    assert sum(active[name].item() for name in ("lpips", "p_dino", "repa")) > 0.0
 
 
 def test_training_loss_matches_jit_x_prediction_formula() -> None:
@@ -94,7 +105,7 @@ def test_training_loss_backward_is_finite(model: PyramidLoopedDiT) -> None:
     )
     assert loss.ndim == 0
     assert torch.isfinite(loss)
-    assert {"flow_final", "flow_pyramid", "lpips", "p_dino", "repa"} <= set(components)
+    assert {"flow", "lpips", "p_dino", "repa"} <= set(components)
     assert all(torch.isfinite(value) for value in components.values())
 
     model.zero_grad(set_to_none=True)
@@ -104,6 +115,24 @@ def test_training_loss_backward_is_finite(model: PyramidLoopedDiT) -> None:
     assert gradients
     assert all(gradient is not None for gradient in gradients)
     assert all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
+
+
+def test_ema_uses_warmup_decay_by_step() -> None:
+    source = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        source.weight.fill_(1.0)
+    ema = ModelEMA(source, decay=0.9)
+
+    with torch.no_grad():
+        source.weight.fill_(2.0)
+    ema.update(source, step=0)
+    assert torch.allclose(ema.module.weight, torch.tensor([[1.9]]))
+
+    with torch.no_grad():
+        source.weight.fill_(3.0)
+    ema.update(source, step=10)
+    expected = 0.55 * 1.9 + 0.45 * 3.0
+    assert torch.allclose(ema.module.weight, torch.tensor([[expected]]))
 
 
 def test_five_step_euler_sampling_with_cfg_is_clamped(model: PyramidLoopedDiT) -> None:

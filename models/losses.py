@@ -104,11 +104,13 @@ class DINOPerceptualLoss(nn.Module):
         self,
         model_name: str = "dinov2_vits14",
         feature_dim: int = 384,
+        layer: int = 11,
         use_pretrained: bool = False,
     ) -> None:
         super().__init__()
         self.model_name = model_name
         self.feature_dim = feature_dim
+        self.layer = layer
         self.use_pretrained = use_pretrained
         self._dino: nn.Module | None = None
         self._load_failed = False
@@ -146,6 +148,12 @@ class DINOPerceptualLoss(nn.Module):
 
     @staticmethod
     def _patch_tokens(output: Any) -> Tensor | None:
+        if isinstance(output, (tuple, list)):
+            for value in reversed(output):
+                tokens = DINOPerceptualLoss._patch_tokens(value)
+                if tokens is not None:
+                    return tokens
+            return None
         if isinstance(output, dict):
             for key in ("x_norm_patchtokens", "x_prenorm", "patch_tokens"):
                 value = output.get(key)
@@ -160,7 +168,24 @@ class DINOPerceptualLoss(nn.Module):
         model = self._load(images.device)
         if model is None:
             return _fallback_patch_features(images, self.feature_dim)
-        output = model.forward_features(self._prepare(images))
+        prepared = self._prepare(images)
+        if hasattr(model, "get_intermediate_layers"):
+            try:
+                output = model.get_intermediate_layers(
+                    prepared,
+                    n=[self.layer],
+                    reshape=False,
+                    return_class_token=False,
+                )
+            except (TypeError, ValueError):
+                output = model.get_intermediate_layers(
+                    prepared,
+                    n=self.layer + 1,
+                    reshape=False,
+                    return_class_token=False,
+                )
+        else:
+            output = model.forward_features(prepared)
         patch_tokens = self._patch_tokens(output)
         if patch_tokens is None or patch_tokens.shape[-1] != self.feature_dim:
             raise RuntimeError("DINOv2 did not return the expected patch-token features")
@@ -246,7 +271,7 @@ class PerceptualLosses(nn.Module):
         return {
             "lpips": lpips_values * gate,
             "p_dino": p_dino_values * gate,
-            "repa": repa_values,
+            "repa": repa_values * gate,
             "gate": gate,
         }
 
@@ -269,18 +294,18 @@ def _model_outputs(
     x_t: Tensor,
     timesteps: Tensor,
     y: Tensor | None,
-) -> tuple[Tensor, Tensor | None, Tensor | None]:
+) -> tuple[Tensor, Tensor | None]:
     try:
-        outputs = model(x_t, timesteps, y, return_pyramid=True)
+        outputs = model(x_t, timesteps, y, return_repa=True)
     except TypeError as error:
-        if "return_pyramid" not in str(error):
+        if "return_repa" not in str(error):
             raise
         outputs = model(x_t, timesteps, y)
     if isinstance(outputs, (tuple, list)):
-        if len(outputs) != 3:
-            raise ValueError("model return_pyramid output must contain three tensors")
-        return outputs[0], outputs[1], outputs[2]
-    return outputs, None, None
+        if len(outputs) != 2:
+            raise ValueError("model return_repa output must contain two tensors")
+        return outputs[0], outputs[1]
+    return outputs, None
 
 
 def training_loss(
@@ -292,7 +317,7 @@ def training_loss(
     perceptual_losses: PerceptualLosses | None = None,
     return_components: bool = False,
 ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
-    """Combine final/pyramid flow matching with gated perceptual supervision."""
+    """Train x-prediction with flow matching and gated perceptual supervision."""
 
     if x1.ndim != 4:
         raise ValueError("x1 must have shape [B, C, H, W]")
@@ -303,37 +328,24 @@ def training_loss(
         raise ValueError("eps must have the same shape as x1")
     time_view = timesteps.reshape(batch_size, 1, 1, 1)
     x_t = time_view * x1 + (1.0 - time_view) * noise
-    x_hat, x_hat_pyramid, repa_tokens = _model_outputs(model, x_t, timesteps, y)
+    x_hat, repa_tokens = _model_outputs(model, x_t, timesteps, y)
     if x_hat.shape != x1.shape:
         raise ValueError("model final prediction must have the same shape as x1")
 
     denominator = (1.0 - time_view).clamp_min(0.05)
     velocity_pred = (x_hat - x_t) / denominator
     velocity_target = x1 - noise
-    flow_final = torch.mean((velocity_pred - velocity_target) ** 2)
-
-    if x_hat_pyramid is None:
-        flow_pyramid = x_hat.new_zeros(())
-    else:
-        pyramid_size = x_hat_pyramid.shape[-2:]
-        x1_pyramid = F.interpolate(x1, size=pyramid_size, mode="bilinear", align_corners=False)
-        x_t_pyramid = F.interpolate(x_t, size=pyramid_size, mode="bilinear", align_corners=False)
-        noise_pyramid = F.interpolate(noise, size=pyramid_size, mode="bilinear", align_corners=False)
-        pyramid_denominator = (1.0 - time_view).clamp_min(0.05)
-        pyramid_velocity = (x_hat_pyramid - x_t_pyramid) / pyramid_denominator
-        pyramid_target = x1_pyramid - noise_pyramid
-        flow_pyramid = torch.mean((pyramid_velocity - pyramid_target) ** 2)
+    flow = torch.mean((velocity_pred - velocity_target) ** 2)
 
     perceptual_losses = perceptual_losses or PerceptualLosses(enabled=True, use_pretrained=False)
     perceptual_values = perceptual_losses.per_sample(x_hat, x1, repa_tokens, timesteps)
     lpips_term = perceptual_values["lpips"].mean()
     p_dino_term = perceptual_values["p_dino"].mean()
     repa_term = perceptual_values["repa"].mean()
-    total = flow_final + flow_pyramid + 0.1 * lpips_term + 0.01 * p_dino_term + 0.1 * repa_term
+    total = flow + 0.1 * lpips_term + 0.01 * p_dino_term + 0.1 * repa_term
 
     components = {
-        "flow_final": flow_final.detach(),
-        "flow_pyramid": flow_pyramid.detach(),
+        "flow": flow.detach(),
         "lpips": lpips_term.detach(),
         "p_dino": p_dino_term.detach(),
         "repa": repa_term.detach(),
