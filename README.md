@@ -1,38 +1,57 @@
-# CelebA-HQ Pyramid-JiT Looped-DiT Lab (v2: Pure Linear Heads + Perceptual Supervision)
+# PixelGen-Aligned Looped-DiT Architecture & Implementation Plan
 
-Implementasi arsitektur **Pyramid-JiT + Looped-DiT** langsung di **Pixel Space** (resolusi $256 \times 256$, tanpa VAE) dengan supervisi perseptual modern (**PixelGen arXiv:2602.02493** & **Linum AI P-JiT**).
-
----
-
-## 1. Arsitektur: Fusi Linear Pyramid-JiT & Looped-DiT (~50M Params)
-
-1. **Pembuangan Bottleneck CNN:**
-   - Membuang total modul CNN upsampler `PyramidDecoder`.
-   - Menggunakan **Linear OutputHead** (`AdaLN-LayerNorm + Linear(512, 16*16*3=768)`) dan direct `unpatchify` (reshape) per-token seperti arsitektur resmi Linum AI dan JiT Kaiming He. Seluruh parameter transformer mengontrol piksel secara langsung.
-2. **Pyramid Multi-Scale Readout:**
-   - **Intermediate Readout (Pyramid Tap):** Membaca token setelah core loop blok untuk memprediksi citra resolusi bertingkat ($128 \times 128$, patch $8 \times 8$).
-   - **Final Head:** Memprediksi citra resolusi penuh ($256 \times 256$, patch $16 \times 16$).
-   - Kedua head adalah modul Linear murni tanpa konvolusi.
-3. **Looped-DiT Core (OpenSenseNova):**
-   - `loop_split = (2, 4, 2)` dengan $D=512$, $N=4$ loops untuk 4 blok inti.
-   - Kedalaman efektif: 20 blok transformer.
-   - Stabilisasi numerik terpasang: **QK-Norm** per-head, **Loop-Boundary RMSNorm**, dan **Bounded adaLN**.
+Implementasi arsitektur **PixelGen-aligned Looped-DiT** langsung di **Pixel Space** (resolusi $256 \times 256$, tanpa VAE) dengan memporting komponen resmi dari **[Zehong-Ma/PixelGen](https://github.com/Zehong-Ma/PixelGen)** (*arXiv:2602.02493*):
 
 ---
 
-## 2. Multi-Objective Perceptual Supervision (PixelGen & Linum AI)
+## 1. Spesifikasi Modul `models/pyramid_looped_dit.py` (Porting PixelGen)
 
-Formulasi loss gabungan:
-$$\mathcal{L} = \mathcal{L}_{\text{FM-final}} + 1.0 \cdot \mathcal{L}_{\text{FM-pyramid}} + g(t) \cdot (0.1 \cdot \mathcal{L}_{\text{LPIPS}} + 0.01 \cdot \mathcal{L}_{\text{P-DINO}}) + 0.1 \cdot \mathcal{L}_{\text{REPA}}$$
+1. **BottleneckPatchEmbed (PixelGen):**
+   - Mengganti patch embed konvensional dengan implementasi persis PixelGen:
+     `proj1 = nn.Conv2d(in_chans, pca_dim=128, kernel_size=16, stride=16, bias=False)`
+     `proj2 = nn.Conv2d(pca_dim=128, embed_dim=hidden_size=512, kernel_size=1, stride=1, bias=True)`
+   - Inisialisasi: `xavier_uniform_` pada view 2D bobot `proj1` dan `proj2`, `proj2.bias = 0`.
+2. **Fixed 2D Sin-Cos Positional Embedding (PixelGen):**
+   - Menghitung `get_2d_sincos_pos_embed(embed_dim=512, grid_size=16)`.
+   - Disimpan sebagai parameter `requires_grad=False`.
+3. **2D Rotary Position Embedding (2D RoPE - VisionRotaryEmbeddingFast):**
+   - Porting `VisionRotaryEmbeddingFast` dan `rotate_half` dari PixelGen.
+   - Dipasang pada query ($q$) dan key ($k$) di setiap layer self-attention.
+4. **Looped Transformer Core dengan JiTBlock (PixelGen style):**
+   - Setiap block terdiri dari:
+     - `norm1 = RMSNorm(hidden_size, eps=1e-6)`
+     - `attn = Attention(dim=512, num_heads=8, qkv_bias=True, qk_norm=True)` dengan 2D RoPE.
+     - `norm2 = RMSNorm(hidden_size, eps=1e-6)`
+     - `mlp = SwiGLUFFN(dim=512, hidden_dim=512 * 4)`
+     - `adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(512, 6 * 512))` dengan **zero-init pada bobot dan bias terakhir**.
+   - Arsitektur Looped: `loop_split = (2, 4, 2)` (2 pre-blocks, 4 core blocks di-loop 4 kali dengan loop-boundary RMSNorm, 2 post-blocks).
+5. **FinalLayer (PixelGen Zero-Init, TANPA TANH):**
+   - Menggantikan output head lama dengan `FinalLayer` resmi PixelGen:
+     - `norm_final = RMSNorm(hidden_size)`
+     - `adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))`
+     - `linear = nn.Linear(hidden_size, patch_size * patch_size * in_channels = 16 * 16 * 3 = 768)`
+   - **Inisialisasi Penting:** `nn.init.zeros_(linear.weight)`, `nn.init.zeros_(linear.bias)`, `nn.init.zeros_(adaLN_modulation[1].weight)`, `nn.init.zeros_(adaLN_modulation[1].bias)`.
+   - **Unpatchify:** Menggunakan fungsi `unpatchify` resmi PixelGen (`torch.einsum('nhwpqc->nchpwq', x)`), **TANPA `torch.tanh`**.
+6. **REPA Projector (PixelGen 3-Layer MLP):**
+   - `proj = nn.Sequential(nn.Linear(512, 512), nn.SiLU(), nn.Linear(512, 512), nn.SiLU(), nn.Linear(512, 384))` (atau 768 jika DINOv2-B).
+   - Ditap dari token setelah iterasi loop ke-4.
 
-1. **Flow Matching Loss ($\mathcal{L}_{\text{FM}}$):**
-   - $x$-prediction rectified flow loss dengan $v$-weighting:
-     $$\hat{v} = \frac{\hat{x}_0 - x_t}{\max(1 - t, 0.05)}, \quad \mathcal{L} = \|\hat{v} - v\|^2$$
-2. **Perceptual Texture Loss ($\mathcal{L}_{\text{LPIPS}}$):**
-   - LPIPS VGG pada prediksi clean image $\hat{x}_0$ versus ground truth $x_0$.
-3. **Perceptual Semantic Loss ($\mathcal{L}_{\text{P-DINO}}$):**
-   - Cosine distance antara patch features DINOv2 dari $\hat{x}_0$ dan $x_0$.
-4. **Representation Alignment ($\mathcal{L}_{\text{REPA}}$):**
-   - Proyeksi linear dari token layer tengah DiT ke DINOv2 patch tokens citra bersih $x_0$.
-5. **Noise Gating $g(t)$ (PixelGen):**
-   - $g(t) = \mathbb{I}(t \ge 0.3)$ (di mana $t=1$ clean, $t=0$ noise). Menonaktifkan loss perseptual pada fase awal high-noise agar tidak merusak diversitas dan recall.
+---
+
+## 2. Spesifikasi Supervisi `models/losses.py` (PixelGen Gated Loss)
+
+1. **Perceptual Gating & Loss:**
+   - Flow matching loss pada clean prediction $\hat{x}_0$: $v$-weighting $(1 - t)$ clamp 0.05.
+   - Noise Gating: $g(t) = \mathbb{I}(t \ge 0.3)$.
+   - $\mathcal{L}_{\text{LPIPS}}$ (bobot 0.1) dengan VGG.
+   - $\mathcal{L}_{\text{P-DINO}}$ (bobot 0.01) pada DINOv2 layer 11.
+   - $\mathcal{L}_{\text{REPA}}$ (bobot 0.1) pada DINOv2 clean tokens.
+   - Tidak ada lagi pyramid flow loss tambahan yang memecah gradien.
+
+---
+
+## 3. Spesifikasi EMA Warmup di `train.py`
+
+- Implementasi dynamic decay warmup:
+  `current_decay = min(self.decay, (1.0 + step) / (10.0 + step))`
+- Update parameter EMA menggunakan `current_decay`.
